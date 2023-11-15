@@ -2445,15 +2445,14 @@ func handleSingleKey(
 	}
 
 	if key == "stringData" && existingObj.GetKind() == "Secret" {
-		// override automatic conversion from stringData to data prior to evaluation
-		existingValue = existingObj.UnstructuredContent()["data"]
-
 		encodedValue, _, err := unstructured.NestedStringMap(existingObj.Object, "data")
 		if err != nil {
 			message := "Error accessing encoded data"
 
 			return message, false, mergedValue, false
 		}
+
+		existingValue = make(map[string]interface{}, len(encodedValue))
 
 		for k, value := range encodedValue {
 			decodedVal, err := base64.StdEncoding.DecodeString(value)
