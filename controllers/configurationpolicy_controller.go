@@ -134,6 +134,9 @@ type ConfigurationPolicyReconciler struct {
 	openAPIParser *openapi.CachedOpenAPIParser
 	// A lock when performing actions that are not thread safe (i.e. reassigning object properties).
 	lock sync.RWMutex
+	// When true, the controller has detected it is being uninstalled and only basic cleanup should be performed before
+	// exiting.
+	UninstallMode bool
 }
 
 //+kubebuilder:rbac:groups=*,resources=*,verbs=*
@@ -166,7 +169,7 @@ func (r *ConfigurationPolicyReconciler) Reconcile(ctx context.Context, request c
 // PeriodicallyExecConfigPolicies loops through all configurationpolicies in the target namespace and triggers
 // template handling for each one. This function drives all the work the configuration policy controller does.
 func (r *ConfigurationPolicyReconciler) PeriodicallyExecConfigPolicies(
-	ctx context.Context, freq uint, elected <-chan struct{},
+	ctx context.Context, freq uint, elected <-chan struct{}, uninstallDetected context.CancelFunc,
 ) {
 	log.Info("Waiting for leader election before periodically evaluating configuration policies")
 
@@ -195,28 +198,41 @@ func (r *ConfigurationPolicyReconciler) PeriodicallyExecConfigPolicies(
 
 		var skipLoop bool
 
-		if len(r.apiResourceList) == 0 || len(r.apiGroups) == 0 {
-			discoveryErr := r.refreshDiscoveryInfo()
+		cleanupImmediately := r.UninstallMode
 
-			// If there was an error and no API information was received, then skip the loop.
-			if discoveryErr != nil && (len(r.apiResourceList) == 0 || len(r.apiGroups) == 0) {
+		if !r.UninstallMode {
+			if len(r.apiResourceList) == 0 || len(r.apiGroups) == 0 {
+				discoveryErr := r.refreshDiscoveryInfo()
+
+				// If there was an error and no API information was received, then skip the loop.
+				if discoveryErr != nil && (len(r.apiResourceList) == 0 || len(r.apiGroups) == 0) {
+					skipLoop = true
+				}
+			}
+
+			// If it's been more than 10 minutes since the last refresh, then refresh the discovery info, but ignore
+			// any errors since the cache can still be used. If a policy encounters an API resource type not in the
+			// cache, the discovery info refresh will be handled there. This periodic refresh is to account for
+			// deleted CRDs or strange edits to the CRD (e.g. converted it from namespaced to not).
+			if time.Since(r.discoveryLastRefreshed) >= waiting {
+				_ = r.refreshDiscoveryInfo()
+			}
+
+			uninstalling, crdDeleting, err := r.cleanupImmediately()
+			if !uninstalling && !crdDeleting && err != nil {
+				log.Error(err, "Failed to determine if it's time to cleanup immediately")
+
 				skipLoop = true
 			}
-		}
 
-		// If it's been more than 10 minutes since the last refresh, then refresh the discovery info, but ignore
-		// any errors since the cache can still be used. If a policy encounters an API resource type not in the
-		// cache, the discovery info refresh will be handled there. This periodic refresh is to account for
-		// deleted CRDs or strange edits to the CRD (e.g. converted it from namespaced to not).
-		if time.Since(r.discoveryLastRefreshed) >= waiting {
-			_ = r.refreshDiscoveryInfo()
-		}
+			cleanupImmediately = crdDeleting
 
-		cleanupImmediately, err := r.cleanupImmediately()
-		if err != nil {
-			log.Error(err, "Failed to determine if it's time to cleanup immediately")
+			if uninstalling {
+				r.UninstallMode = uninstalling
+				cleanupImmediately = true
 
-			skipLoop = true
+				uninstallDetected()
+			}
 		}
 
 		if cleanupImmediately || !skipLoop {
@@ -667,30 +683,27 @@ func (r *ConfigurationPolicyReconciler) cleanUpChildObjects(plc policyv1.Configu
 	return deletionFailures
 }
 
-// cleanupImmediately returns true when the cluster is in a state where configurationpolicies should
-// be removed as soon as possible, ignoring the pruneObjectBehavior of the policies. This is the
-// case when the controller is being uninstalled or the CRD is being deleted.
-func (r *ConfigurationPolicyReconciler) cleanupImmediately() (bool, error) {
-	beingUninstalled, beingUninstalledErr := r.isBeingUninstalled()
-	if beingUninstalledErr == nil && beingUninstalled {
-		return true, nil
+// cleanupImmediately returns true (i.e. beingUninstalled or crdDeleting) when the cluster is in a state where
+// configurationpolicies should be removed as soon as possible, ignoring the pruneObjectBehavior of the policies. This
+// is the case when the controller is being uninstalled or the CRD is being deleted.
+func (r *ConfigurationPolicyReconciler) cleanupImmediately() (beingUninstalled bool, crdDeleting bool, err error) {
+	var beingUninstalledErr error
+
+	beingUninstalled, beingUninstalledErr = IsBeingUninstalled(r.Client)
+
+	var defErr error
+
+	crdDeleting, defErr = r.definitionIsDeleting()
+
+	if beingUninstalledErr != nil && defErr != nil {
+		err = fmt.Errorf("%w; %w", beingUninstalledErr, defErr)
+	} else if beingUninstalledErr != nil {
+		err = beingUninstalledErr
+	} else if defErr != nil {
+		err = defErr
 	}
 
-	defDeleting, defErr := r.definitionIsDeleting()
-	if defErr == nil && defDeleting {
-		return true, nil
-	}
-
-	if beingUninstalledErr == nil && defErr == nil {
-		// if either was deleting, we would've already returned.
-		return false, nil
-	}
-
-	// At least one had an unexpected error, so the decision can't be made right now
-	//nolint:errorlint // we can't choose just one of the errors to "correctly" wrap
-	return false, fmt.Errorf(
-		"isBeingUninstalled error: '%v', definitionIsDeleting error: '%v'", beingUninstalledErr, defErr,
-	)
+	return
 }
 
 func (r *ConfigurationPolicyReconciler) definitionIsDeleting() (bool, error) {
@@ -761,18 +774,24 @@ func (r *ConfigurationPolicyReconciler) handleObjectTemplates(plc policyv1.Confi
 
 	// object handling for when configurationPolicy is deleted
 	if plc.Spec.PruneObjectBehavior == "DeleteIfCreated" || plc.Spec.PruneObjectBehavior == "DeleteAll" {
-		cleanupNow, err := r.cleanupImmediately()
-		if err != nil {
-			log.Error(err, "Error determining whether to cleanup immediately, requeueing policy")
+		var crdDeleting bool
 
-			return
+		if !r.UninstallMode {
+			var err error
+
+			crdDeleting, err = r.definitionIsDeleting()
+			if err != nil {
+				log.Error(err, "Error determining whether to cleanup immediately, requeueing policy")
+
+				return
+			}
 		}
 
-		if cleanupNow {
+		if r.UninstallMode || crdDeleting {
 			if objHasFinalizer(&plc, pruneObjectFinalizer) {
 				patch := removeObjFinalizerPatch(&plc, pruneObjectFinalizer)
 
-				err = r.Patch(context.TODO(), &plc, client.RawPatch(types.JSONPatchType, patch))
+				err := r.Patch(context.TODO(), &plc, client.RawPatch(types.JSONPatchType, patch))
 				if err != nil {
 					log.V(1).Error(err, "Error removing finalizer for configuration policy")
 
@@ -815,7 +834,7 @@ func (r *ConfigurationPolicyReconciler) handleObjectTemplates(plc policyv1.Confi
 
 				patch := removeObjFinalizerPatch(&plc, pruneObjectFinalizer)
 
-				err = r.Patch(context.TODO(), &plc, client.RawPatch(types.JSONPatchType, patch))
+				err := r.Patch(context.TODO(), &plc, client.RawPatch(types.JSONPatchType, patch))
 				if err != nil {
 					log.V(1).Error(err, "Error removing finalizer for configuration policy")
 
@@ -1488,6 +1507,7 @@ func (r *ConfigurationPolicyReconciler) handleObjects(
 	}
 
 	var existingObj *unstructured.Unstructured
+	var allResourceNames []string
 
 	if objDetails.name != "" { // named object, so checking just for the existence of the specific object
 		// If the object couldn't be retrieved, this will be handled later on.
@@ -1502,7 +1522,7 @@ func (r *ConfigurationPolicyReconciler) handleObjects(
 		log.V(1).Info(
 			"The object template does not specify a name. Will search for matching objects in the namespace.",
 		)
-		objNames = getNamesOfKind(
+		objNames, allResourceNames = getNamesOfKind(
 			desiredObj,
 			mapping.Resource,
 			objDetails.isNamespaced,
@@ -1525,10 +1545,19 @@ func (r *ConfigurationPolicyReconciler) handleObjects(
 
 		if len(objNames) == 0 {
 			exists = false
+		} else if len(objNames) == 1 {
+			// If the object couldn't be retrieved, this will be handled later on.
+			existingObj, _ = getObject(
+				objDetails.isNamespaced, namespace, objNames[0], mapping.Resource, r.TargetK8sDynamicClient,
+			)
+
+			exists = existingObj != nil
 		}
 	}
 
 	objShouldExist := !strings.EqualFold(string(objectT.ComplianceType), string(policyv1.MustNotHave))
+
+	shouldAddCondensedRelatedObj := false
 
 	if len(objNames) == 1 {
 		name := objNames[0]
@@ -1572,6 +1601,15 @@ func (r *ConfigurationPolicyReconciler) handleObjects(
 			} else {
 				resultEvent.compliant = false
 				resultEvent.reason = reasonWantFoundDNE
+				// Length of objNames = 0, complianceType == musthave or mustonlyhave
+				// Find Noncompliant resources to add to the status.relatedObjects for debugging purpose
+				shouldAddCondensedRelatedObj = true
+				if objDetails.kind != "" && objDetails.name == "" {
+					// Change reason to Resource found but does not match
+					if len(allResourceNames) > 0 {
+						resultEvent.reason = reasonWantFoundNoMatch
+					}
+				}
 			}
 		} else {
 			if exists {
@@ -1580,21 +1618,36 @@ func (r *ConfigurationPolicyReconciler) handleObjects(
 			} else {
 				resultEvent.compliant = true
 				resultEvent.reason = reasonWantNotFoundDNE
+				// Compliant, complianceType == mustnothave
+				// Find resources in the same namespace to add to the status.relatedObjects for debugging purpose
+				shouldAddCondensedRelatedObj = true
 			}
 		}
 
 		result = objectTmplEvalResult{objectNames: objNames, events: []objectTmplEvalEvent{resultEvent}}
 
-		relatedObjects = addRelatedObjects(
-			resultEvent.compliant,
-			mapping.Resource,
-			objDetails.kind,
-			namespace,
-			objDetails.isNamespaced,
-			objNames,
-			resultEvent.reason,
-			nil,
-		)
+		if shouldAddCondensedRelatedObj {
+			// relatedObjs name is *
+			relatedObjects = addCondensedRelatedObjs(
+				mapping.Resource,
+				resultEvent.compliant,
+				objDetails.kind,
+				namespace,
+				objDetails.isNamespaced,
+				resultEvent.reason,
+			)
+		} else {
+			relatedObjects = addRelatedObjects(
+				resultEvent.compliant,
+				mapping.Resource,
+				objDetails.kind,
+				namespace,
+				objDetails.isNamespaced,
+				objNames,
+				resultEvent.reason,
+				nil,
+			)
+		}
 	}
 
 	return relatedObjects, result
@@ -1922,6 +1975,7 @@ func buildNameList(
 
 // getNamesOfKind returns an array with names of all of the resources found
 // matching the GVK specified.
+// allResourceList includes names that are under the same namespace and kind.
 func getNamesOfKind(
 	desiredObj unstructured.Unstructured,
 	rsrc schema.GroupVersionResource,
@@ -1930,30 +1984,31 @@ func getNamesOfKind(
 	dclient dynamic.Interface,
 	complianceType string,
 	zeroValueEqualsNil bool,
-) (kindNameList []string) {
+) (kindNameList []string, allResourceList []string) {
+	var resList *unstructured.UnstructuredList
+	var err error
+
 	if namespaced {
 		res := dclient.Resource(rsrc).Namespace(ns)
 
-		resList, err := res.List(context.TODO(), metav1.ListOptions{})
-		if err != nil {
-			log.Error(err, "Could not list resources", "rsrc", rsrc, "namespaced", namespaced)
+		resList, err = res.List(context.TODO(), metav1.ListOptions{})
+	} else {
+		res := dclient.Resource(rsrc)
 
-			return kindNameList
-		}
-
-		return buildNameList(desiredObj, complianceType, resList, zeroValueEqualsNil)
+		resList, err = res.List(context.TODO(), metav1.ListOptions{})
 	}
 
-	res := dclient.Resource(rsrc)
-
-	resList, err := res.List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		log.Error(err, "Could not list resources", "rsrc", rsrc, "namespaced", namespaced)
 
-		return kindNameList
+		return kindNameList, allResourceList
 	}
 
-	return buildNameList(desiredObj, complianceType, resList, zeroValueEqualsNil)
+	for _, res := range resList.Items {
+		allResourceList = append(allResourceList, res.GetName())
+	}
+
+	return buildNameList(desiredObj, complianceType, resList, zeroValueEqualsNil), allResourceList
 }
 
 // enforceByCreatingOrDeleting can handle the situation where a musthave or mustonlyhave object is
@@ -2525,7 +2580,11 @@ func (r *ConfigurationPolicyReconciler) checkAndUpdateResource(
 
 	var statusMismatch bool
 
+	isInform := strings.EqualFold(string(remediation), string(policyv1.Inform))
+	handledKeys := map[string]bool{}
+
 	for key := range obj.desiredObj.Object {
+		handledKeys[key] = true
 		isStatus := key == "status"
 
 		// use metadatacompliancetype to evaluate metadata if it is set
@@ -2564,8 +2623,6 @@ func (r *ConfigurationPolicyReconciler) checkAndUpdateResource(
 		}
 
 		if keyUpdateNeeded {
-			isInform := strings.EqualFold(string(remediation), string(policyv1.Inform))
-
 			// If a key didn't match but the cluster supports dry run mode, then continue merging the object
 			// and then run a dry run update request to see if the Kubernetes API agrees with the assesment.
 			if isInform && !r.DryRunSupported {
@@ -2585,6 +2642,24 @@ func (r *ConfigurationPolicyReconciler) checkAndUpdateResource(
 				if !isInform {
 					log.Info("Queuing an update for the object due to a value mismatch", "key", key)
 				}
+			}
+		}
+	}
+
+	// If the complianceType is "mustonlyhave", then compare the existing object's keys,
+	// skipping over: previously compared keys, metadata, and status.
+	if complianceType == "mustonlyhave" {
+		for key := range obj.existingObj.Object {
+			if handledKeys[key] || key == "status" || key == "metadata" {
+				continue
+			}
+
+			delete(obj.existingObj.Object, key)
+
+			updateNeeded = true
+
+			if !isInform {
+				log.Info("Queuing an update for the object due to a value mismatch", "key", key)
 			}
 		}
 	}
@@ -2734,6 +2809,10 @@ func (r *ConfigurationPolicyReconciler) setEvaluatedObject(
 func (r *ConfigurationPolicyReconciler) alreadyEvaluated(
 	policy *policyv1.ConfigurationPolicy, currentObject *unstructured.Unstructured,
 ) (evaluated bool, compliant bool) {
+	if policy == nil || currentObject == nil {
+		return false, false
+	}
+
 	loadedPolicyMap, loaded := r.processedPolicyCache.Load(policy.GetUID())
 	if !loaded {
 		return false, false
@@ -2876,6 +2955,7 @@ func (r *ConfigurationPolicyReconciler) updatePolicyStatus(
 		"Updating configurationPolicy status", "status", policy.Status.ComplianceState, "policy", policy.GetName(),
 	)
 
+	evaluatedUID := policy.UID
 	updatedStatus := policy.Status
 
 	maxRetries := 3
@@ -2885,6 +2965,19 @@ func (r *ConfigurationPolicyReconciler) updatePolicyStatus(
 			log.Info(fmt.Sprintf("Failed to refresh policy; using previously fetched version: %s", err))
 		} else {
 			policy.Status = updatedStatus
+
+			// If the UID has changed, then the policy has been deleted and created again. Do not update the status,
+			// because it was calculated based on a previous version. If sendEvent is true, that event might be useful
+			// and it can be emitted. By leaving the status blank, the policy will be reevaluated and send a new event.
+			if evaluatedUID != policy.UID {
+				log.Info("The ConfigurationPolicy was recreated after it was evaluated. Skipping the status update.")
+
+				// Reset the original UID so that if there are more status updates (i.e. batches), the status on the
+				// API server is never updated.
+				policy.UID = evaluatedUID
+
+				break
+			}
 		}
 
 		err = r.Status().Update(context.TODO(), policy)
@@ -3018,7 +3111,7 @@ func convertPolicyStatusToString(plc *policyv1.ConfigurationPolicy) string {
 
 // getDeployment gets the Deployment object associated with this controller. If the controller is running outside of
 // a cluster, no Deployment object or error will be returned.
-func (r *ConfigurationPolicyReconciler) getDeployment() (*appsv1.Deployment, error) {
+func getDeployment(client client.Client) (*appsv1.Deployment, error) {
 	key, err := common.GetOperatorNamespacedName()
 	if err != nil {
 		// Running locally
@@ -3030,15 +3123,15 @@ func (r *ConfigurationPolicyReconciler) getDeployment() (*appsv1.Deployment, err
 	}
 
 	deployment := appsv1.Deployment{}
-	if err := r.Client.Get(context.TODO(), key, &deployment); err != nil {
+	if err := client.Get(context.TODO(), key, &deployment); err != nil {
 		return nil, err
 	}
 
 	return &deployment, nil
 }
 
-func (r *ConfigurationPolicyReconciler) isBeingUninstalled() (bool, error) {
-	deployment, err := r.getDeployment()
+func IsBeingUninstalled(client client.Client) (bool, error) {
+	deployment, err := getDeployment(client)
 	if deployment == nil || err != nil {
 		return false, err
 	}
@@ -3049,7 +3142,7 @@ func (r *ConfigurationPolicyReconciler) isBeingUninstalled() (bool, error) {
 // removeLegacyDeploymentFinalizer removes the policy.open-cluster-management.io/delete-related-objects on the
 // Deployment object. This finalizer is no longer needed on the Deployment object, so it is removed.
 func (r *ConfigurationPolicyReconciler) removeLegacyDeploymentFinalizer() error {
-	deployment, err := r.getDeployment()
+	deployment, err := getDeployment(r.Client)
 	if deployment == nil || err != nil {
 		return err
 	}

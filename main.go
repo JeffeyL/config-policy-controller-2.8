@@ -274,6 +274,34 @@ func main() {
 		os.Exit(1)
 	}
 
+	terminatingCtx := ctrl.SetupSignalHandler()
+
+	uninstallingCtx, uninstallingCtxCancel := context.WithCancel(terminatingCtx)
+
+	var beingUninstalled bool
+
+	// Can't use the manager client because the manager isn't started yet.
+	uninstallCheckClient, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		log.Error(err, "Failed to determine if the controller is being uninstalled at startup. Will assume it's not.")
+	} else {
+		beingUninstalled, err = controllers.IsBeingUninstalled(uninstallCheckClient)
+		if err != nil {
+			log.Error(
+				err,
+				"Failed to determine if the controller is being uninstalled at startup. Will assume it's not.",
+			)
+		}
+	}
+
+	if beingUninstalled {
+		log.Info("The controller is being uninstalled. Will enter uninstall mode.")
+
+		uninstallingCtxCancel()
+	} else {
+		log.V(2).Info("The controller is not being uninstalled. Will continue as normal.")
+	}
+
 	var targetK8sClient kubernetes.Interface
 	var targetK8sDynamicClient dynamic.Interface
 	var targetK8sConfig *rest.Config
@@ -299,16 +327,21 @@ func main() {
 		targetK8sClient = kubernetes.NewForConfigOrDie(targetK8sConfig)
 		targetK8sDynamicClient = dynamic.NewForConfigOrDie(targetK8sConfig)
 
-		nsSelMgr, err = manager.New(targetK8sConfig, manager.Options{
-			NewCache: cache.BuilderWithOptions(cache.Options{
-				TransformByObject: map[client.Object]toolscache.TransformFunc{
-					&corev1.Namespace{}: nsTransform,
-				},
-			}),
-		})
-		if err != nil {
-			log.Error(err, "Unable to create manager from target kube config")
-			os.Exit(1)
+		// The managed cluster's API server is potentially not the same as the hosting cluster and it could be
+		// offline already as part of the uninstall process. In this case, the manager's instantiation will fail.
+		// This controller is not needed in uninstall mode, so just skip it.
+		if !beingUninstalled {
+			nsSelMgr, err = manager.New(targetK8sConfig, manager.Options{
+				NewCache: cache.BuilderWithOptions(cache.Options{
+					TransformByObject: map[client.Object]toolscache.TransformFunc{
+						&corev1.Namespace{}: nsTransform,
+					},
+				}),
+			})
+			if err != nil {
+				log.Error(err, "Unable to create manager from target kube config")
+				os.Exit(1)
+			}
 		}
 
 		log.Info(
@@ -319,30 +352,35 @@ func main() {
 
 	instanceName, _ := os.Hostname() // on an error, instanceName will be empty, which is ok
 
-	nsSelReconciler := common.NamespaceSelectorReconciler{
-		Client: nsSelMgr.GetClient(),
-	}
-	if err = nsSelReconciler.SetupWithManager(nsSelMgr); err != nil {
-		log.Error(err, "Unable to create controller", "controller", "NamespaceSelector")
-		os.Exit(1)
-	}
+	var nsSelReconciler common.NamespaceSelectorReconciler
+	var dryRunSupported bool
 
-	discoveryClient := discovery.NewDiscoveryClientForConfigOrDie(targetK8sConfig)
+	if !beingUninstalled {
+		nsSelReconciler = common.NamespaceSelectorReconciler{
+			Client: nsSelMgr.GetClient(),
+		}
+		if err = nsSelReconciler.SetupWithManager(nsSelMgr); err != nil {
+			log.Error(err, "Unable to create controller", "controller", "NamespaceSelector")
+			os.Exit(1)
+		}
 
-	serverVersion, err := discoveryClient.ServerVersion()
-	if err != nil {
-		log.Error(err, "unable to detect the managed cluster's Kubernetes version")
-		os.Exit(1)
-	}
+		discoveryClient := discovery.NewDiscoveryClientForConfigOrDie(targetK8sConfig)
 
-	dryRunSupported := semver.Compare(serverVersion.GitVersion, "v1.18.0") >= 0
-	if dryRunSupported {
-		log.Info("The managed cluster supports dry run API requests")
-	} else {
-		log.Info(
-			"The managed cluster does not support dry run API requests. Will assume that empty values are equal to " +
-				"not being set.",
-		)
+		serverVersion, err := discoveryClient.ServerVersion()
+		if err != nil {
+			log.Error(err, "unable to detect the managed cluster's Kubernetes version")
+			os.Exit(1)
+		}
+
+		dryRunSupported = semver.Compare(serverVersion.GitVersion, "v1.18.0") >= 0
+		if dryRunSupported {
+			log.Info("The managed cluster supports dry run API requests")
+		} else {
+			log.Info(
+				"The managed cluster does not support dry run API requests. Will assume that empty values are equal " +
+					"to not being set.",
+			)
+		}
 	}
 
 	reconciler := controllers.ConfigurationPolicyReconciler{
@@ -358,6 +396,7 @@ func main() {
 		TargetK8sConfig:        targetK8sConfig,
 		SelectorReconciler:     &nsSelReconciler,
 		EnableMetrics:          opts.enableMetrics,
+		UninstallMode:          beingUninstalled,
 	}
 
 	OpReconciler := controllers.OperatorPolicyReconciler{
@@ -388,14 +427,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	terminatingCtx := ctrl.SetupSignalHandler()
 	managerCtx, managerCancel := context.WithCancel(context.Background())
 
 	// PeriodicallyExecConfigPolicies is the go-routine that periodically checks the policies
 	log.V(1).Info("Periodically processing Configuration Policies", "frequency", opts.frequency)
 
 	go func() {
-		reconciler.PeriodicallyExecConfigPolicies(terminatingCtx, opts.frequency, mgr.Elected())
+		reconciler.PeriodicallyExecConfigPolicies(terminatingCtx, opts.frequency, mgr.Elected(), uninstallingCtxCancel)
 		managerCancel()
 	}()
 
@@ -459,11 +497,13 @@ func main() {
 		wg.Done()
 	}()
 
-	if opts.targetKubeConfig != "" { // "hosted mode"
+	if !beingUninstalled && opts.targetKubeConfig != "" { // "hosted mode"
 		wg.Add(1)
 
 		go func() {
-			if err := nsSelMgr.Start(managerCtx); err != nil {
+			// Use the uninstallingCtx so that this shuts down when the controller is being uninstalled. This is
+			// important since the managed cluster's API server may become unavailable at this time when in hosted mdoe.
+			if err := nsSelMgr.Start(uninstallingCtx); err != nil {
 				log.Error(err, "Problem running manager")
 
 				managerCancel()
